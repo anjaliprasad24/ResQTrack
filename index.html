@@ -3680,8 +3680,26 @@
 
   <div class="toast" id="toast"></div>
 
-  <script>
-    const API = 'http://localhost:3001/api';
+  <script type="module">
+    import { createClient } from '@supabase/supabase-js';
+
+    const isLocalHost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+    const viteApiBase = import.meta.env.VITE_API_BASE_URL || '';
+    const viteBackendBase = import.meta.env.VITE_BACKEND_BASE_URL || '';
+    const viteWsUrl = import.meta.env.VITE_WS_URL || '';
+    const API = (window.__RESQTRACK_API__ || viteApiBase || (isLocalHost ? 'http://localhost:3001/api' : '/api')).replace(/\/$/, '');
+    const BACKEND_BASE = (window.__RESQTRACK_BACKEND__ || viteBackendBase || (isLocalHost ? 'http://localhost:3001' : window.location.origin)).replace(/\/$/, '');
+    const WS_URL = (window.__RESQTRACK_WS__ || viteWsUrl || (isLocalHost ? 'ws://localhost:3001/ws' : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`));
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+    const supabase = supabaseUrl && supabaseAnonKey && !supabaseUrl.includes('YOUR_PROJECT')
+      ? createClient(supabaseUrl, supabaseAnonKey, {
+          auth: { persistSession: true, autoRefreshToken: true }
+        })
+      : null;
+    if (supabase) {
+      window.supabase = supabase;
+    }
     const DEST = { Critical: 'CARE Animal Hospital, Velachery', Medium: 'Blue Cross of India, Guindy', Low: 'PAWS Shelter, Anna Nagar' };
     const STATUS_STEPS = ['Pending', 'Assigned', 'On the way', 'Rescued'];
     const STATUS_ICONS = { Pending: '🕐', Assigned: '✅', 'On the way': '🛵', Rescued: '❤️' };
@@ -3714,7 +3732,88 @@
       localStorage.removeItem('rq_refresh');
     }
 
+    function resolveBackendUrl(path) {
+      if (!path) return null;
+      if (/^https?:\/\//i.test(path) || /^wss?:\/\//i.test(path)) return path;
+      if (path.startsWith('/')) return `${BACKEND_BASE}${path}`;
+      return `${BACKEND_BASE}/${path}`;
+    }
+
     async function apiFetch(path, options = {}) {
+      if (supabase) {
+        try {
+          const isReportsPath = path.startsWith('/reports');
+          if (isReportsPath) {
+            const { data: { user }, error: userError } = await supabase.auth.getUser();
+            if (userError || !user) {
+              return { error: userError?.message || 'Please sign in first' };
+            }
+
+            const method = (options.method || 'GET').toUpperCase();
+            if (method === 'GET') {
+              const { data, error } = await supabase
+                .from('reports')
+                .select('*')
+                .order('created_at', { ascending: false });
+              if (error) return { error: error.message };
+              if (currentUser?.type === 'individual') {
+                return data.filter(item => item.user_id === user.id);
+              }
+              return data;
+            }
+
+            if (method === 'POST' && path === '/reports') {
+              const form = options.body instanceof FormData ? options.body : null;
+              const payload = form ? {
+                description: form.get('description') || '',
+                lat: parseFloat(form.get('lat')) || null,
+                lng: parseFloat(form.get('lng')) || null,
+                location_label: form.get('locationLabel') || 'Chennai',
+                severity: form.get('severity') || 'Medium',
+                photo_url: null,
+                user_id: user.id,
+                status: 'Pending'
+              } : JSON.parse(options.body || '{}');
+
+              const { data, error } = await supabase
+                .from('reports')
+                .insert([payload])
+                .select()
+                .single();
+              if (error) return { error: error.message };
+              return data;
+            }
+
+            if (path.match(/^\/reports\/[0-9]+\/accept$/)) {
+              const id = path.split('/')[2];
+              const { data, error } = await supabase
+                .from('reports')
+                .update({ status: 'Assigned', assigned_org_name: currentUser?.name || 'Org', assigned_to: user.id })
+                .eq('id', Number(id))
+                .select()
+                .single();
+              if (error) return { error: error.message };
+              return data;
+            }
+
+            if (path.match(/^\/reports\/[0-9]+\/status$/)) {
+              const id = path.split('/')[2];
+              const body = JSON.parse(options.body || '{}');
+              const { data, error } = await supabase
+                .from('reports')
+                .update({ status: body.status })
+                .eq('id', Number(id))
+                .select()
+                .single();
+              if (error) return { error: error.message };
+              return data;
+            }
+          }
+        } catch (err) {
+          return { error: err.message || 'Supabase request failed' };
+        }
+      }
+
       const token = localStorage.getItem('rq_access');
       try {
         const res = await fetch(API + path, {
@@ -3789,19 +3888,42 @@
     }
 
     // ── AUTH ─────────────────────────────────────────────
+    async function authenticateWithSupabase(email, password, role) {
+      if (!supabase) {
+        throw new Error('Supabase is not configured yet. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+      }
+
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+      if (signInError) {
+        const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: { role } }
+        });
+        if (signUpError) throw signUpError;
+        if (signUpData.session) {
+          return signUpData;
+        }
+        const { data: retryData, error: retryError } = await supabase.auth.signInWithPassword({ email, password });
+        if (retryError) throw retryError;
+        return retryData;
+      }
+
+      return signInData;
+    }
+
     async function loginIndividual() {
       const email = document.getElementById('ind-email').value.trim().toLowerCase();
       if (!email) return;
       const btn = document.getElementById('ind-submit');
       btn.disabled = true; btn.textContent = 'Signing in…';
       try {
-        let data = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email, password: email }) });
-        if (!data?.accessToken) {
-          data = await apiFetch('/auth/register', { method: 'POST', body: JSON.stringify({ email, password: email, role: 'individual' }) });
+        const data = await authenticateWithSupabase(email, email, 'individual');
+        if (!data?.session) {
+          throw new Error('Supabase login did not return an active session.');
         }
-        if (!data?.accessToken) { alert('Login failed: ' + (data?.error || data?.message || 'Unknown error')); return; }
-        localStorage.setItem('rq_access', data.accessToken);
-        localStorage.setItem('rq_refresh', data.refreshToken || '');
+        localStorage.setItem('rq_access', data.session.access_token);
+        localStorage.setItem('rq_refresh', data.session.refresh_token || '');
         currentUser = { type: 'individual', email: data.user?.email || email, name: data.user?.email || email };
         saveUser(currentUser);
         navigate('individual-dashboard');
@@ -3824,13 +3946,12 @@
         const orgLng = known ? known.lng : 80.22;
         const password = (known ? known.id : 'custom') + '_pass';
         const orgEmail = email || (known ? known.id : 'custom') + '@resqtrack.in';
-        let data = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email: orgEmail, password }) });
-        if (!data?.accessToken) {
-          data = await apiFetch('/auth/register', { method: 'POST', body: JSON.stringify({ email: orgEmail, password, role: 'org', orgName: name || orgEmail, lat: orgLat, lng: orgLng }) });
+        const data = await authenticateWithSupabase(orgEmail, password, 'org');
+        if (!data?.session) {
+          throw new Error('Supabase login did not return an active session.');
         }
-        if (!data?.accessToken) { alert('Login failed: ' + (data?.error || data?.message || 'Unknown error')); return; }
-        localStorage.setItem('rq_access', data.accessToken);
-        localStorage.setItem('rq_refresh', data.refreshToken || '');
+        localStorage.setItem('rq_access', data.session.access_token);
+        localStorage.setItem('rq_refresh', data.session.refresh_token || '');
         currentUser = { type: 'org', name: name || orgEmail, email: orgEmail, lat: orgLat, lng: orgLng };
         saveUser(currentUser);
         navigate('org-dashboard');
@@ -3847,16 +3968,36 @@
       document.getElementById('org-name-input').value = name;
       document.getElementById('org-email-input').value = email;
       document.getElementById('org-submit').disabled = false;
-      let data = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      if (!data?.accessToken) {
-        data = await apiFetch('/auth/register', { method: 'POST', body: JSON.stringify({ email, password, role: 'org', orgName: name, lat, lng }) });
+      const btn = document.getElementById('org-submit');
+      btn.disabled = true; btn.textContent = 'Signing in…';
+      try {
+        if (supabase) {
+          const data = await authenticateWithSupabase(email, password, 'org');
+          if (!data?.session) {
+            throw new Error('Supabase login did not return an active session.');
+          }
+          localStorage.setItem('rq_access', data.session.access_token);
+          localStorage.setItem('rq_refresh', data.session.refresh_token || '');
+          currentUser = { type: 'org', id, name, email, lat, lng };
+          saveUser(currentUser);
+          navigate('org-dashboard');
+        } else {
+          let data = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+          if (!data?.accessToken) {
+            data = await apiFetch('/auth/register', { method: 'POST', body: JSON.stringify({ email, password, role: 'org', orgName: name, lat, lng }) });
+          }
+          if (!data?.accessToken) { alert('Login failed: ' + (data?.error || data?.message || 'Unknown error')); return; }
+          localStorage.setItem('rq_access', data.accessToken);
+          localStorage.setItem('rq_refresh', data.refreshToken || '');
+          currentUser = { type: 'org', id, name, email, lat, lng };
+          saveUser(currentUser);
+          navigate('org-dashboard');
+        }
+      } catch (err) {
+        alert('Login failed: ' + (err.message || 'Unknown error'));
+      } finally {
+        btn.disabled = false; btn.textContent = 'Access dashboard →';
       }
-      if (!data?.accessToken) { alert('Login failed: ' + (data?.error || data?.message || 'Unknown error')); return; }
-      localStorage.setItem('rq_access', data.accessToken);
-      localStorage.setItem('rq_refresh', data.refreshToken || '');
-      currentUser = { type: 'org', id, name, email, lat, lng };
-      saveUser(currentUser);
-      navigate('org-dashboard');
     }
 
     function checkOrgForm() {
@@ -3865,7 +4006,14 @@
       document.getElementById('org-submit').disabled = !(n || e);
     }
 
-    function logout() { clearUser(); currentUser = null; navigate('home'); }
+    async function logout() {
+      clearUser();
+      currentUser = null;
+      if (supabase) {
+        await supabase.auth.signOut();
+      }
+      navigate('home');
+    }
 
     // ── INDIVIDUAL DASHBOARD ──────────────────────────────
     async function refreshMyReports() {
@@ -3937,15 +4085,21 @@
           form.append('photo', blob, 'photo.jpg');
         }
         const token = localStorage.getItem('rq_access');
-        const res = await fetch(API + '/reports', {
-          method: 'POST',
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-          body: form,
-        });
-        const text = await res.text();
         let report;
-        try { report = text ? JSON.parse(text) : {}; } catch { report = { error: text || 'Invalid response' }; }
-        if (!res.ok || !report?.id) { alert('Submit failed: ' + (report?.error || report?.message || 'Unknown error')); return; }
+        if (supabase) {
+          report = await apiFetch('/reports', { method: 'POST', body: form });
+        } else {
+          const res = await fetch(API + '/reports', {
+            method: 'POST',
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            body: form,
+          });
+          const text = await res.text();
+          try { report = text ? JSON.parse(text) : {}; } catch { report = { error: text || 'Invalid response' }; }
+          if (!res.ok || !report?.id) { alert('Submit failed: ' + (report?.error || report?.message || 'Unknown error')); return; }
+        }
+        if (!report?.id && !report?.error) { alert('Submit failed: Unknown error'); return; }
+        if (report?.error) { alert('Submit failed: ' + report.error); return; }
         document.getElementById('desc-input').value = '';
         photoSrc = null; currentSev = 'Medium';
         document.getElementById('upz-inner').innerHTML = `<div style="font-size:24px;margin-bottom:7px">📸</div><div style="font-size:12px;color:rgba(255,255,255,0.4)"><strong style="color:var(--gold)">Click to upload</strong> or drag & drop</div><div style="font-size:10px;color:rgba(255,255,255,0.3);margin-top:3px">JPG, PNG up to 10MB</div>`;
@@ -3987,7 +4141,7 @@
       const cards = visible.map(r => {
         const isOwn = r.assigned_org_name === currentUser.name;
         const statusOpts = STATUS_STEPS.filter(s => s !== 'Pending').map(s => `<option value="${s}"${r.status === s ? ' selected' : ''}>${s}</option>`).join('');
-        const photoUrl = r.photo_url ? (r.photo_url.startsWith('http') ? r.photo_url : `http://localhost:3001${r.photo_url}`) : null;
+        const photoUrl = r.photo_url ? resolveBackendUrl(r.photo_url) : null;
         return `<div class="rpcard" style="${r.severity === 'Critical' ? 'border-left:3px solid rgba(192,57,43,0.6)' : ''}">
             ${photoUrl ? `<div style="width:100%;height:180px;background:#2a2a2a;border-radius:8px;margin-bottom:12px;overflow:hidden;display:flex;align-items:center;justify-content:center"><img src="${escapeHtml(photoUrl)}" alt="case photo" style="width:100%;height:100%;object-fit:contain;object-position:center;display:block"></div>` : `<div style="width:100%;height:180px;background:rgba(212,175,55,0.05);border-radius:8px;margin-bottom:12px;display:flex;align-items:center;justify-content:center;font-size:48px">📸</div>`}
             <div class="rptop">
@@ -4041,7 +4195,7 @@
     function connectWS() {
       try {
         if (ws) ws.close();
-        ws = new WebSocket('ws://localhost:3001/ws');
+        ws = new WebSocket(WS_URL);
         ws.onmessage = (e) => {
           try {
             const msg = JSON.parse(e.data);
@@ -4087,7 +4241,7 @@
             distKm: Math.random() * 10,
             desc: item.description || '',
             emoji: '🐾',
-            photo: item.photo_url ? (item.photo_url.startsWith('http') ? item.photo_url : `http://localhost:3001${item.photo_url}`) : null,
+            photo: item.photo_url ? resolveBackendUrl(item.photo_url) : null,
             uploadedAt: new Date(item.created_at),
             contact: { name: 'Contact', phone: '', email: '' }
           }));
@@ -4289,7 +4443,7 @@
           distKm: +(Math.random() * 8 + 0.5).toFixed(1),
           desc,
           emoji: typeEmoji(type),
-          photo: photoUrl ? (photoUrl.startsWith('http') ? photoUrl : `http://localhost:3001${photoUrl}`) : null,
+          photo: photoUrl ? resolveBackendUrl(photoUrl) : null,
           uploadedAt: new Date(),
           contact: {
             name: document.getElementById('f-contact-name')?.value.trim() || 'Anonymous',
@@ -4429,6 +4583,29 @@
       if (_oMrks.length) _oMap.fitBounds(L.featureGroup(_oMrks).getBounds().pad(0.25));
       setTimeout(() => _oMap.invalidateSize(), 300);
     }
+
+    // Expose functions to window so they are accessible by inline HTML event listeners in Vite build
+    window.navigate = navigate;
+    window.handleScroll = handleScroll;
+    window.scrollToLogin = scrollToLogin;
+    window.loginIndividual = loginIndividual;
+    window.checkOrgForm = checkOrgForm;
+    window.pickDemoOrg = pickDemoOrg;
+    window.loginOrg = loginOrg;
+    window.logout = logout;
+    window.handleDrop = handleDrop;
+    window.handleFile = handleFile;
+    window.setSev = setSev;
+    window.submitReport = submitReport;
+    window.renderBrowse = renderBrowse;
+    window.setFilter = setFilter;
+    window.pickRadio = pickRadio;
+    window.handleAdoptPhotos = handleAdoptPhotos;
+    window.submitAdoptionListing = submitAdoptionListing;
+    window.setOrgFilter = setOrgFilter;
+    window.acceptCase = acceptCase;
+    window.updateStatus = updateStatus;
+    window.openAdoptContact = openAdoptContact;
   </script>
 </body>
 
