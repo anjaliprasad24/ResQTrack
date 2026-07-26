@@ -17,10 +17,10 @@ create table if not exists public.reports (
 alter table public.reports enable row level security;
 
 create policy if not exists "Users can view their own reports" on public.reports
-  for select using (auth.uid() = user_id);
+  for select using (auth.uid() = user_id or coalesce((auth.jwt() -> 'user_metadata' ->> 'role'), '') = 'org');
 
 create policy if not exists "Users can insert their own reports" on public.reports
   for insert with check (auth.uid() = user_id);
 
 create policy if not exists "Users can update their own reports" on public.reports
-  for update using (auth.uid() = user_id);
+  for update using (auth.uid() = user_id or coalesce((auth.jwt() -> 'user_metadata' ->> 'role'), '') = 'org');
